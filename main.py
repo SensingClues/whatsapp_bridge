@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 import os
@@ -8,13 +9,26 @@ import requests
 app = FastAPI()
 
 # =========================
+# CORS (REQUIRED for frontend)
+# =========================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "https://central-test.sensingclues.org",
+        "https://central.sensingclues.org",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =========================
 # Environment variables
 # =========================
-
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")  # e.g. whatsapp:+14155238886
-
 CLUEY_ACCESS_TOKEN = os.environ.get("CLUEY_ACCESS_TOKEN")
 
 if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_WHATSAPP_FROM:
@@ -37,7 +51,6 @@ PARTICIPANT_INDEX = {}
 # =========================
 # Health
 # =========================
-
 @app.get("/")
 def health():
     return {"status": "ok"}
@@ -45,7 +58,6 @@ def health():
 # =========================
 # Start WhatsApp incident
 # =========================
-
 @app.post("/whatsapp/incident/start")
 async def start_incident(request: Request):
     """
@@ -86,7 +98,6 @@ async def start_incident(request: Request):
 # =========================
 # Send WhatsApp message
 # =========================
-
 @app.post("/send")
 async def send_whatsapp(request: Request):
     """
@@ -133,7 +144,6 @@ async def send_whatsapp(request: Request):
 # =========================
 # Incoming WhatsApp webhook
 # =========================
-
 @app.post("/twilio/webhook")
 async def twilio_webhook(request: Request):
     """

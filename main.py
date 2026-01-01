@@ -1,184 +1,147 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client
 import os
-import requests
+import json
+import time
+from typing import Dict, List
 
-app = FastAPI()
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
 
-# =========================
-# CORS (REQUIRED for frontend)
-# =========================
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "https://central-test.sensingclues.org",
-        "https://central.sensingclues.org",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+import redis
+from twilio.rest import Client
+from twilio.twiml.messaging_response import MessagingResponse
 
-# =========================
-# Environment variables
-# =========================
+# --------------------------------------------------
+# ENV
+# --------------------------------------------------
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")  # e.g. whatsapp:+14155238886
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM")
 CLUEY_ACCESS_TOKEN = os.environ.get("CLUEY_ACCESS_TOKEN")
+REDIS_URL = os.environ.get("REDIS_URL")
 
-if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_WHATSAPP_FROM:
-    raise RuntimeError("Missing Twilio environment variables")
+if not REDIS_URL:
+    raise RuntimeError("Missing REDIS_URL")
 
 if not CLUEY_ACCESS_TOKEN:
     raise RuntimeError("Missing CLUEY_ACCESS_TOKEN")
 
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+# --------------------------------------------------
+# CLIENTS
+# --------------------------------------------------
+twilio = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
-# =========================
-# In-memory mappings (MVP)
-# =========================
-# alertId -> {"participant": "...", "pid": "..."}
-INCIDENTS = {}
+# --------------------------------------------------
+# APP
+# --------------------------------------------------
+app = FastAPI()
 
-# participant -> alertId
-PARTICIPANT_INDEX = {}
 
-# =========================
-# Health
-# =========================
-@app.get("/")
-def health():
-    return {"status": "ok"}
+# --------------------------------------------------
+# MODELS
+# --------------------------------------------------
+class StartIncident(BaseModel):
+    alertId: str
+    pid: str
+    participant: str
 
-# =========================
-# Start WhatsApp incident
-# =========================
+
+class SendMessage(BaseModel):
+    alertId: str
+    message: str
+
+
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+def redis_key(alert_id: str) -> str:
+    return f"alert:{alert_id}:messages"
+
+
+def store_message(alert_id: str, payload: Dict):
+    redis_client.rpush(redis_key(alert_id), json.dumps(payload))
+
+
+def load_messages(alert_id: str) -> List[Dict]:
+    raw = redis_client.lrange(redis_key(alert_id), 0, -1)
+    return [json.loads(r) for r in raw]
+
+
+# --------------------------------------------------
+# ENDPOINTS
+# --------------------------------------------------
 @app.post("/whatsapp/incident/start")
-async def start_incident(request: Request):
-    """
-    Body:
-    {
-      "alertId": "n12b8e8d9c64912ea",
-      "pid": "8633548",
-      "participant": "whatsapp:+31636037414"
-    }
-    """
-    data = await request.json()
-
-    alert_id = data.get("alertId")
-    pid = data.get("pid")
-    participant = data.get("participant")
-
-    if not alert_id or not pid or not participant:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Missing 'alertId', 'pid' or 'participant'"}
-        )
-
-    INCIDENTS[alert_id] = {
-        "participant": participant,
-        "pid": pid
-    }
-    PARTICIPANT_INDEX[participant] = alert_id
-
-    return JSONResponse(
-        content={
-            "status": "started",
-            "alertId": alert_id,
-            "pid": pid,
-            "participant": participant
-        }
+def start_incident(data: StartIncident):
+    store_message(
+        data.alertId,
+        {
+            "id": f"sys-{int(time.time())}",
+            "direction": "system",
+            "text": f"WhatsApp conversation started for alert {data.alertId}",
+            "timestamp": int(time.time() * 1000),
+        },
     )
 
-# =========================
-# Send WhatsApp message
-# =========================
+    return {
+        "status": "started",
+        "alertId": data.alertId,
+        "participant": data.participant,
+    }
+
+
 @app.post("/send")
-async def send_whatsapp(request: Request):
-    """
-    Body:
-    {
-      "alertId": "n12b8e8d9c64912ea",
-      "message": "tekst"
+def send_message(data: SendMessage):
+    try:
+        msg = twilio.messages.create(
+            from_=TWILIO_WHATSAPP_FROM,
+            to="whatsapp:+31636037414",
+            body=data.message,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    store_message(
+        data.alertId,
+        {
+            "id": msg.sid,
+            "direction": "outbound",
+            "text": data.message,
+            "timestamp": int(time.time() * 1000),
+        },
+    )
+
+    return {
+        "status": "sent",
+        "sid": msg.sid,
+        "alertId": data.alertId,
     }
-    """
-    data = await request.json()
 
-    alert_id = data.get("alertId")
-    message = data.get("message")
 
-    if not alert_id or not message:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Missing 'alertId' or 'message'"}
-        )
-
-    incident = INCIDENTS.get(alert_id)
-    if not incident:
-        return JSONResponse(
-            status_code=404,
-            content={"error": f"No WhatsApp participant for alertId {alert_id}"}
-        )
-
-    participant = incident["participant"]
-
-    msg = client.messages.create(
-        from_=TWILIO_WHATSAPP_FROM,
-        to=participant,
-        body=message
-    )
-
-    return JSONResponse(
-        content={
-            "status": "sent",
-            "alertId": alert_id,
-            "sid": msg.sid
-        }
-    )
-
-# =========================
-# Incoming WhatsApp webhook
-# =========================
-@app.post("/twilio/webhook")
-async def twilio_webhook(request: Request):
-    """
-    Called by Twilio when a WhatsApp message is received
-    """
+@app.post("/whatsapp/inbound")
+async def inbound_whatsapp(request: Request):
     form = await request.form()
+    text = form.get("Body")
     from_number = form.get("From")
-    body = form.get("Body")
 
-    alert_id = PARTICIPANT_INDEX.get(from_number)
+    alert_id = redis_client.get(f"phone:{from_number}:alert")
+
     if not alert_id:
-        resp = MessagingResponse()
-        resp.message("Geen actief incident gekoppeld aan dit nummer.")
-        return PlainTextResponse(str(resp))
+        raise HTTPException(status_code=404, detail="No alert bound to this sender")
 
-    incident = INCIDENTS.get(alert_id)
-    pid = incident["pid"]
-
-    url = f"https://cluey.test.sensingclues.org/v1/projects/{pid}/alerts/{alert_id}/actions"
-
-    headers = {
-        "x-access-token": CLUEY_ACCESS_TOKEN,
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "description": body
-    }
-
-    r = requests.post(url, json=payload, headers=headers)
+    store_message(
+        alert_id,
+        {
+            "id": f"in-{int(time.time())}",
+            "direction": "inbound",
+            "text": text,
+            "timestamp": int(time.time() * 1000),
+        },
+    )
 
     resp = MessagingResponse()
-    if r.status_code == 200:
-        resp.message("Ontvangen en toegevoegd aan incident.")
-    else:
-        resp.message("Fout bij verwerken van bericht.")
+    return str(resp)
 
-    return PlainTextResponse(str(resp))
+
+@app.get("/alerts/{alertId}/messages")
+def get_messages(alertId: str):
+    return load_messages(alertId)
